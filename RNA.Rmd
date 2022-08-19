@@ -1,0 +1,278 @@
+---
+title: "gene-level exploratory analysis and differential expression"
+author: "郑启蒙"
+date: "2022-08-17"
+output: html_document
+---
+
+```{r}
+library(airway)
+dir <- system.file("extdata", package="airway", mustWork=TRUE)
+list.files(dir)
+list.files(file.path(dir, "quants"))
+csvfile <- file.path(dir, "sample_table.csv")
+coldata <- read.csv(csvfile, row.names=1, stringsAsFactors=FALSE)
+coldata
+```
+coldata <- coldata[1:2,]
+coldata$names <- coldata$Run
+coldata$files <- file.path(dir, "quants", coldata$names, "quant.sf.gz")
+file.exists(coldata$files)
+
+library("tximeta")
+se <- tximeta(coldata)
+dim(se)
+head(rownames(se))
+
+接下来我们将把在基因水平上总结转录本表达定量的结果
+```{r}
+gse <- summarizeToGene
+
+```
+对行和列重命名（主要是为了画图时的标注）
+```{r}
+gse$cell <- gse$donor
+gse$dex <- gse$condition
+levels(gse$dex) <- c("untrt", "trt")
+```
+在R中最好第一个control是 空白对照，第二个是处理组，如果数据不是这种情况，可以利用
+```{R}
+library("magrittr")
+gse$dex %<>% relevel("untrt")
+gse$dex
+#用下面的也一样
+gse$dex <- relevel(gse$dex, "untrt")
+```
+选择用于差异表达分析的变量 **~ cell + dex**
+当然还可以有其他的形式，**~ group + treatment + group:treatment**，具体可见于?results
+下面进行差异表达分析
+```{r}
+library("DESeq2")
+dds <- DESeqDataSet(gse, design = ~ cell + dex)
+```
+注意标准gse的数据格式
+### Starting from count matrices
+featurecounts的结果就是这样
+```{r}
+# 创造一个只有counts数和基因信息的矩阵
+countdata <- round(assays(gse)[["counts"]])
+coldata <- colData(gse)
+ddsMat <- DESeqDataSetFromMatrix(countData = countdata,
+                                 colData = coldata,
+                                 design = ~ cell + dex)
+```
+### Exploratory analysis and visualization
+#### 数据预处理
+有许多row数据的counts数为0，或者是只匹配到很少的counts数。为了保证运行速度，需要提前对数据进行处理。
+```{r}
+# 要求counts数大于1
+keep <- rowSums(counts(dds)) > 1
+dds <- dds[keep,]
+nrow(dds)
+#要求每一行有3个以上样本匹配到的counts数大于10
+keep <- rowSums(counts(dds) >= 10) >= 3
+```
+#### 数据可视化
+许多多元分析方法，例如聚类、pca（主成分分析），适合于方差相同，但是平均值不同的数据，也就是方差齐次性。
+但是理想的rna-seq数据是随着均值的增大，方差也增大。For example, if one performs PCA directly on a matrix of counts or normalized counts (e.g. correcting for differences in sequencing depth), the resulting plot typically depends mostly on the genes with highest counts because they show the largest absolute differences between samples. 
+通常可以用log2(cts + 1)，会导致一些counts数很少的基因的噪声增加。
+
+DEseq2提出了两种解决方法：VDT 和 rlog
+当n>30时选择VST
+不过当进行差异测试的时候，还是推荐使用raw data，将在后面讲解。
+```{r}
+#使用vst进行数据处理
+vsd <- vst(dds, blind = FALSE)
+head(assay(vsd), 3)
+colData(vsd)
+
+#使用rlog进行数据处理
+rld <- rlog(dds, blind = FALSE)
+head(assay(rld), 3)
+```
+blind =FALSE 表明实验处理和样本差异对counts数的平均数--方差变化没有影响。
+The experimental design is not used directly in the transformation, only in estimating the global amount of variability in the counts. For a fully unsupervised transformation, one can set blind = TRUE (which is the default).
+```{r}
+#估计transform的影响
+library("dplyr")
+library("ggplot2")
+
+dds <- estimateSizeFactors(dds)
+
+df <- bind_rows(
+  as_data_frame(log2(counts(dds, normalized=TRUE)[, 1:2]+1)) %>%
+    mutate(transformation = "log2(x + 1)"),
+  as_data_frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"),
+  as_data_frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+colnames(df)[1:2] <- c("x", "y")  
+
+lvls <- c("log2(x + 1)", "vst", "rlog")
+df$transformation <- factor(df$transformation, levels=lvls)
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)
+
+```
+```{r echo=FALSE}
+knitr::include_graphics("F:/1.png")
+```
+## SummarizedExperiment objects
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+从上图可以看到，经过cst个rlog处理之后，在进行差异分析的时候counts数很少的基因对结果的影响很少，噪声低。
+x轴是样本一在各个基因上的counts数，y轴是样本二在各个基因上的counts数
+
+#### 4.3衡量样本之间的距离
+##### 4.3.1欧几里何距离
+使用欧几里何距离来衡量样本之间的距离，为了保证所有基因对差异的贡献大致相同，我们使用vst数据。
+我们使用dist函数，注意dist函数要求row为要显示差异的样本，column为维度。
+```{r}
+#距离的可视化--heatmap
+library("pheatmap")
+library("RColorBrewer")
+#将三角矩阵补全
+sampleDistMatrix <- as.matrix( sampleDists )
+#补充样本名称信息
+rownames(sampleDistMatrix) <- paste( vsd$dex, vsd$cell, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+#设置颜色
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+#绘制火山图
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+##### 4.3.2 poisson距离
+```{r}
+#使用原始数据
+library("PoiClaClu")
+poisd <- PoissonDistance(t(counts(dds)))
+samplePoisDistMatrix <- as.matrix( poisd$dd )
+rownames(samplePoisDistMatrix) <- paste( dds$dex, dds$cell, sep=" - " )
+colnames(samplePoisDistMatrix) <- NULL
+pheatmap(samplePoisDistMatrix,
+         clustering_distance_rows = poisd$dd,
+         clustering_distance_cols = poisd$dd,
+         col = colors)
+```
+#### 4.4 PCA
+```{r}
+plotPCA(vsd, intgroup = c("dex", "cell"))
+#也可以使用ggplot2使图像更加清楚
+pcaData <- plotPCA(vsd, intgroup = c( "dex", "cell"), returnData = TRUE)
+pcaData
+#显示主成分所占的比例
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2, color = dex, shape = cell)) +
+  geom_point(size =3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  ggtitle("PCA with VST data")
+```
+### 4.5 Generalized PCA
+当数据不是正常分布时（比如说，数据的离散度太大）
+```{r}
+library("glmpca")
+gpca <- glmpca(counts(dds), L=2)
+gpca.dat <- gpca$factors
+gpca.dat$dex <- dds$dex
+gpca.dat$cell <- dds$cell
+```
+### 4.6 MDS plot
+没有数据矩阵，只有距离矩阵
+```{r}
+mds <- as.data.frame(colData(vsd))  %>%
+         cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = dex, shape = cell)) +
+  geom_point(size = 3) + coord_fixed() + ggtitle("MDS with VST data")
+```
+## 5 差异表达分析 Differential expression analysis
+```{r}
+dds <- DESeq(dds)
+res <- results(dds)
+res
+```
+
+比较dex两个水平的差异
+```{r}
+res <- results(dds, contrast=c("dex","trt","untrt"))
+mcols(res, use.names = TRUE)
+```
+------
+输出：D
+ataFrame with 6 rows and 2 columns
+                       type            description
+                <character>            <character>
+baseMean       intermediate mean of normalized c..
+log2FoldChange      results log2 fold change (ML..
+lfcSE               results standard error: dex ..
+stat                results Wald statistic: dex ..
+pvalue              results Wald test p-value: d..
+padj                results   BH adjusted p-values
+
+baseMean：标准化之后的样本counts的平均值
+log2FoldChange：处理对基因表达差异可能的影响（注意是log2 fold change）
+lfcSE：结果的标准误
+pvalue：在100个样本中，有p个样本是错误的
+------
+```{r}
+summary(res)
+```
+-----
+out of 31604 with nonzero total read count
+adjusted p-value < 0.1
+LFC > 0 (up)       : 2373, 7.5% （前面有提到过，最好把untreated的sample放在前面）
+LFC < 0 (down)     : 1949, 6.2%
+outliers [1]       : 0, 0%
+low counts [2]     : 14706, 47%
+(mean count < 9)
+[1] see 'cooksCutoff' argument of ?results
+[2] see 'independentFiltering' argument of ?results
+
+P-value显然太大了，要想降低P-value，降低FDR，有两种方法：
+
+1、lower the false discovery rate threshold (the threshold on padj in the results table)
+2、raise the log2 fold change threshold from 0 using the lfcThreshold argument of results
+
+第一种方法
+```{r}
+res.05 <- results(dds, alpha = 0.05)
+table(res.05$padj < 0.05)
+```
+第二种方法
+```{r}
+resLFC1 <- results(dds, lfcThreshold=1)
+table(resLFC1$padj < 0.1)
+```
+-----
+### 其他比对
+除了比较不同dex的差异，还可以比较cell等的差异
+### Multiple testing
+在高通量测序当中，我们要谨慎使用pvalue。因为高通量测序的数据过大，假设我们有10000个基因，当p<0.05是，有100个基因是错误的。
+所以在DEseq中使用 BH adjusted p-values
+
+## Plotting results
+### MA plot
+M 两个样本表达差异的倍数取log2
+A 基因在两个样本中的丰度平均值
+
+
+
+
+
